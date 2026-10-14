@@ -9,15 +9,15 @@ from itertools import count
 
 MOCK_EMPLOYEES = {
     "EMP1001": {
-        "employee_id": "EMP1001", "first_name": "Jonathan", "last_name": "Gamit", "full_name": "Jonathan Gamit", "department": "Finance", "region": "APAC",
+        "employee_id": "EMP1001", "first_name": "Alex", "last_name": "Santos", "full_name": "Alex Santos", "email": "alex.santos@example.com", "department": "Finance", "region": "APAC",
         "account_status": "LOCKED", "data_source": "SIMULATED",
     },
     "EMP1002": {
-        "employee_id": "EMP1002", "first_name": "Onick", "last_name": "Roxas", "full_name": "Onick Roxas", "department": "Human Resources", "region": "EMEA",
+        "employee_id": "EMP1002", "first_name": "Maria", "last_name": "Reyes", "full_name": "Maria Reyes", "email": "maria.reyes@example.com", "department": "Human Resources", "region": "EMEA",
         "account_status": "ACTIVE", "data_source": "SIMULATED",
     },
     "EMP1003": {
-        "employee_id": "EMP1003", "first_name": "Leslie", "last_name": "David", "full_name": "Leslie David", "department": "Technology", "region": "AMER",
+        "employee_id": "EMP1003", "first_name": "Daniel", "last_name": "Cruz", "full_name": "Daniel Cruz", "email": "daniel.cruz@example.com", "department": "Technology", "region": "AMER",
         "account_status": "ACTIVE", "data_source": "SIMULATED",
     },
 }

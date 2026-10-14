@@ -2550,7 +2550,7 @@ class GeminiService(ServicePlugin):
                 # the most recent successful mock employee lookup so each
                 # transfer carries identity fields even when Gemini omits them.
                 allowed_context_fields = (
-                    "employee_id", "employee_name", "first_name", "last_name",
+                    "employee_id", "employee_name", "first_name", "last_name", "email",
                     "department", "region", "account_status", "concern_type",
                     "concern_category", "issue_summary", "data_source",
                     "ticket_number", "ticket_type", "kb_article_id", "routing_target",
@@ -2579,6 +2579,7 @@ class GeminiService(ServicePlugin):
                 handoff_context.setdefault("employee_name", employee_name)
                 handoff_context.setdefault("first_name", first_name)
                 handoff_context.setdefault("last_name", last_name)
+                handoff_context.setdefault("email", str(employee.get("email") or employee.get("email_address") or employee.get("emailAddress") or ""))
                 handoff_context.setdefault("department", str(employee.get("department") or ""))
                 handoff_context.setdefault("region", str(employee.get("region") or ""))
                 handoff_context.setdefault("account_status", str(employee.get("account_status") or employee.get("accountStatus") or ""))
