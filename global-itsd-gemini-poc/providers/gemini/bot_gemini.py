@@ -18,8 +18,9 @@ Role:
           file → `DEFAULT_SYSTEM_PROMPT` constant), with
           `{{variable}}` interpolation against `bot.start.payload.context`.
           See `_load_base_prompt` and `_compose_system_prompt`.
-        * **Tool definitions** — `transfer_to_agent` and `end_session`
-          declared inline in `_connect_gemini`'s `setup` payload,
+        * **Tool definitions** — mock ITSD KB, self-service, ticket, regional-route,
+          employee-lookup, `transfer_to_agent`, and `end_session` tools declared inline in
+          `_connect_gemini`'s `setup` payload,
           not in a Gemini dashboard. The bridge owns the schemas.
         * **Conversation initiation** — bridge sends an explicit
           `realtimeInput.text = "Hello, please greet the customer
@@ -193,6 +194,13 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, UTC
 from typing import TYPE_CHECKING, Any, Dict, Optional
+from providers.gemini.itsd_mock_backend import (
+    lookup_employee,
+    search_kb,
+    run_self_service,
+    create_mock_ticket,
+    get_regional_route,
+)
 
 import ssl as _ssl
 
@@ -448,8 +456,8 @@ class GeminiService(ServicePlugin):
               `{{variable}}` placeholders against
               `bot.start.payload.context` and appends a
               call-context line.
-            * **Tool schemas** — `transfer_to_agent` and
-              `end_session` declared inline in
+            * **Tool schemas** — `itsd_lookup_employee`,
+              `transfer_to_agent`, and `end_session` declared inline in
               `_connect_gemini`'s `setup` payload. Both are
               bridge-implemented: there are no Gemini-platform
               system tools.
@@ -1914,6 +1922,22 @@ class GeminiService(ServicePlugin):
                                             "type": "string",
                                             "description": "Brief reason for the transfer",
                                         },
+                                        "handoff_context": {
+                                            "type": "object",
+                                            "description": (
+                                                "Non-sensitive summary for the human agent. "
+                                                "Include only simulated employee details and issue summary."
+                                            ),
+                                            "properties": {
+                                                "employee_id": {"type": "string"},
+                                                "department": {"type": "string"},
+                                                "region": {"type": "string"},
+                                                "account_status": {"type": "string"},
+                                                "issue_summary": {"type": "string"},
+                                                "data_source": {"type": "string"},
+                                            },
+                                            "required": [],
+                                        },
                                     },
                                     "required": [],
                                 },
@@ -1931,6 +1955,82 @@ class GeminiService(ServicePlugin):
                                     "required": [],
                                 },
                             },
+                            
+                            {
+                                "name": "itsd_search_kb",
+                                "description": "Search the simulated approved ServiceNow knowledge base for password reset, account lockout, or access request guidance. Returns mock KB articles only.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "query": {"type": "string", "description": "Short description of the employee's IT issue"},
+                                        "category": {"type": "string", "enum": ["password_reset", "account_lockout", "access_request", "general"]},
+                                    },
+                                    "required": ["query"],
+                                },
+                            },
+                            {
+                                "name": "itsd_self_service_action",
+                                "description": "Run a simulated self-service walkthrough for password reset, account unlock, or access request. It does not change any real account or submit any real request.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "employee_id": {"type": "string"},
+                                        "action": {"type": "string", "enum": ["password_reset", "account_unlock", "access_request"]},
+                                        "application": {"type": "string", "description": "Application/system name, required for access requests"},
+                                        "resolved": {"type": "boolean", "description": "Whether the caller confirms the issue is resolved after mock guidance"},
+                                    },
+                                    "required": ["employee_id", "action"],
+                                },
+                            },
+                            {
+                                "name": "itsd_create_ticket",
+                                "description": "Create a simulated ServiceNow incident or service request record in the in-memory POC only. Never creates a real ServiceNow record.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "record_type": {"type": "string", "enum": ["incident", "request"]},
+                                        "employee_id": {"type": "string"},
+                                        "region": {"type": "string"},
+                                        "short_description": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "category": {"type": "string"},
+                                        "kb_article_id": {"type": "string"},
+                                    },
+                                    "required": ["record_type", "employee_id", "short_description", "description"],
+                                },
+                            },
+                            {
+                                "name": "itsd_get_regional_route",
+                                "description": "Resolve the simulated regional IT Service Desk destination based on employee region. This only returns a POC routing label; it does not route a live call by itself.",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {"region": {"type": "string"}},
+                                    "required": ["region"],
+                                },
+                            },
+                            {
+                                "name": "itsd_lookup_employee",
+                                "description": (
+                                    "Look up an employee ID in the simulated "
+                                    "Global IT Service Desk demo dataset. "
+                                    "This is not identity verification."
+                                ),
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "employee_id": {
+                                            "type": "string",
+                                            "description": (
+                                                "The employee ID provided by the caller"
+                                            ),
+                                        },
+                                    },
+                                    "required": ["employee_id"],
+                                },
+                            },
+
+
+
                         ]
                     }
                 ],
@@ -2387,14 +2487,66 @@ class GeminiService(ServicePlugin):
             if not isinstance(args, dict):
                 args = {}
 
-            if name == "transfer_to_agent":
+            if name == "itsd_search_kb":
+                result = search_kb(str(args.get("query") or ""), str(args.get("category") or "general"))
+                result_text = json.dumps(result, ensure_ascii=False)
+            elif name == "itsd_self_service_action":
+                result = run_self_service(
+                    employee_id=str(args.get("employee_id") or ""),
+                    action=str(args.get("action") or ""),
+                    application=str(args.get("application") or ""),
+                    resolved=args.get("resolved"),
+                )
+                result_text = json.dumps(result, ensure_ascii=False)
+            elif name == "itsd_create_ticket":
+                result = create_mock_ticket(
+                    record_type=str(args.get("record_type") or "incident"),
+                    employee_id=str(args.get("employee_id") or ""),
+                    region=str(args.get("region") or ""),
+                    short_description=str(args.get("short_description") or ""),
+                    description=str(args.get("description") or ""),
+                    category=str(args.get("category") or "general"),
+                    kb_article_id=str(args.get("kb_article_id") or ""),
+                )
+                result_text = json.dumps(result, ensure_ascii=False)
+            elif name == "itsd_get_regional_route":
+                result = get_regional_route(str(args.get("region") or ""))
+                result_text = json.dumps(result, ensure_ascii=False)
+            elif name == "itsd_lookup_employee":
+                employee_id = str(args.get("employee_id") or "")
+                lookup_result = lookup_employee(employee_id)
+                result_text = json.dumps(lookup_result, ensure_ascii=False)
+            elif name == "transfer_to_agent":
                 reason = str(args.get("reason") or "Caller requested live agent")
+                raw_context = args.get("handoff_context") or {}
+                if not isinstance(raw_context, dict):
+                    raw_context = {}
+
+                # Only pass the agreed, non-sensitive handoff fields.
+                allowed_context_fields = (
+                    "employee_id",
+                    "department",
+                    "region",
+                    "account_status",
+                    "issue_summary",
+                    "data_source",
+                    "ticket_number",
+                    "ticket_type",
+                    "kb_article_id",
+                    "routing_target",
+                )
+                handoff_context = {"reason": reason}
+                for field_name in allowed_context_fields:
+                    value = raw_context.get(field_name)
+                    if value is not None:
+                        handoff_context[field_name] = str(value)[:500]
+
                 handoff_payload = {
                     "ftype": "LIVE_AGENT_HANDOFF",
                     "liveAgentHandoff": {
                         "queueId": "",
                         "tags": [],
-                        "context": {"reason": reason},
+                        "context": handoff_context,
                     },
                 }
                 # Defer emission until Gemini's goodbye turn finishes; otherwise
