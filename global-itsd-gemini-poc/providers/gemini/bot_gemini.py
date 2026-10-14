@@ -1922,6 +1922,11 @@ class GeminiService(ServicePlugin):
                                             "type": "string",
                                             "description": "Brief reason for the transfer",
                                         },
+                                        "concern_category": {
+                                            "type": "string",
+                                            "enum": ["PASSWORD_RESET", "ACCOUNT_LOCK", "ACCESS_REQUEST", "OTHER"],
+                                            "description": "Normalized ITSD concern category to expose to the Infinity workflow after handoff.",
+                                        },
                                         "handoff_context": {
                                             "type": "object",
                                             "description": (
@@ -1935,6 +1940,10 @@ class GeminiService(ServicePlugin):
                                                 "account_status": {"type": "string"},
                                                 "issue_summary": {"type": "string"},
                                                 "data_source": {"type": "string"},
+                                                "concern_category": {"type": "string"},
+                                                "kb_article_id": {"type": "string"},
+                                                "ticket_number": {"type": "string"},
+                                                "ticket_type": {"type": "string"},
                                             },
                                             "required": [],
                                         },
@@ -2517,12 +2526,17 @@ class GeminiService(ServicePlugin):
                 lookup_result = lookup_employee(employee_id)
                 result_text = json.dumps(lookup_result, ensure_ascii=False)
             elif name == "transfer_to_agent":
-                reason = str(args.get("reason") or "Caller requested live agent")
+                reason = str(args.get("reason") or "Caller requested live agent")[:500]
                 raw_context = args.get("handoff_context") or {}
                 if not isinstance(raw_context, dict):
                     raw_context = {}
 
-                # Only pass the agreed, non-sensitive handoff fields.
+                # Use a fixed category allowlist so the workflow receives a predictable value.
+                allowed_categories = {"PASSWORD_RESET", "ACCOUNT_LOCK", "ACCESS_REQUEST", "OTHER"}
+                raw_category = str(args.get("concern_category") or raw_context.get("concern_category") or "OTHER").strip().upper()
+                concern_category = raw_category if raw_category in allowed_categories else "OTHER"
+
+                # Only pass agreed, non-sensitive context fields to Infinity.
                 allowed_context_fields = (
                     "employee_id",
                     "department",
@@ -2535,17 +2549,21 @@ class GeminiService(ServicePlugin):
                     "kb_article_id",
                     "routing_target",
                 )
-                handoff_context = {"reason": reason}
+                handoff_context = {"reason": reason, "concern_category": concern_category}
                 for field_name in allowed_context_fields:
                     value = raw_context.get(field_name)
                     if value is not None:
                         handoff_context[field_name] = str(value)[:500]
+                # Keep the category consistent in both the event context and tags.
+                handoff_context["concern_category"] = concern_category
 
+                # Optional single POC queue. Leave blank until a real Infinity queue ID is configured.
+                queue_id = os.getenv("ITSD_GENERAL_QUEUE_ID", "").strip()
                 handoff_payload = {
                     "ftype": "LIVE_AGENT_HANDOFF",
                     "liveAgentHandoff": {
-                        "queueId": "",
-                        "tags": [],
+                        "queueId": queue_id,
+                        "tags": [concern_category],
                         "context": handoff_context,
                     },
                 }
