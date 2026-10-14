@@ -427,6 +427,10 @@ class BotConversation:
     # payload.transcript.startTsMs on the eventual TRANSCRIPT emit.
     bot_turn_started_at: Optional[int] = None
     customer_turn_started_at: Optional[int] = None
+    # Last simulated employee lookup for this call. Used to enrich every
+    # handoff even if Gemini omits identity fields from tool arguments.
+    last_employee_lookup: Dict[str, Any] = field(default_factory=dict)
+    last_concern_type: str = ""
 
 
 class GeminiService(ServicePlugin):
@@ -1930,9 +1934,14 @@ class GeminiService(ServicePlugin):
                                             ),
                                             "properties": {
                                                 "employee_id": {"type": "string"},
+                                                "employee_name": {"type": "string"},
+                                                "first_name": {"type": "string"},
+                                                "last_name": {"type": "string"},
                                                 "department": {"type": "string"},
                                                 "region": {"type": "string"},
                                                 "account_status": {"type": "string"},
+                                                "concern_type": {"type": "string", "description": "Normalized issue category, e.g. password_reset, account_lockout, access_request, general"},
+                                                "concern_category": {"type": "string", "description": "Compatibility alias for concern_type"},
                                                 "issue_summary": {"type": "string"},
                                                 "data_source": {"type": "string"},
                                             },
@@ -2488,24 +2497,33 @@ class GeminiService(ServicePlugin):
                 args = {}
 
             if name == "itsd_search_kb":
-                result = search_kb(str(args.get("query") or ""), str(args.get("category") or "general"))
+                category = str(args.get("category") or "general").strip().lower()
+                if category:
+                    convo.last_concern_type = category
+                result = search_kb(str(args.get("query") or ""), category)
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_self_service_action":
+                action = str(args.get("action") or "").strip().lower()
+                if action in ("password_reset", "account_unlock", "access_request"):
+                    convo.last_concern_type = {"account_unlock": "account_lockout"}.get(action, action)
                 result = run_self_service(
                     employee_id=str(args.get("employee_id") or ""),
-                    action=str(args.get("action") or ""),
+                    action=action,
                     application=str(args.get("application") or ""),
                     resolved=args.get("resolved"),
                 )
                 result_text = json.dumps(result, ensure_ascii=False)
             elif name == "itsd_create_ticket":
+                ticket_category = str(args.get("category") or "general").strip().lower()
+                if ticket_category:
+                    convo.last_concern_type = ticket_category
                 result = create_mock_ticket(
                     record_type=str(args.get("record_type") or "incident"),
                     employee_id=str(args.get("employee_id") or ""),
                     region=str(args.get("region") or ""),
                     short_description=str(args.get("short_description") or ""),
                     description=str(args.get("description") or ""),
-                    category=str(args.get("category") or "general"),
+                    category=ticket_category,
                     kb_article_id=str(args.get("kb_article_id") or ""),
                 )
                 result_text = json.dumps(result, ensure_ascii=False)
@@ -2515,6 +2533,12 @@ class GeminiService(ServicePlugin):
             elif name == "itsd_lookup_employee":
                 employee_id = str(args.get("employee_id") or "")
                 lookup_result = lookup_employee(employee_id)
+                # Cache only the simulated lookup result for this call so the
+                # handoff payload can reliably include employee identity.
+                if isinstance(lookup_result, dict) and lookup_result.get("found"):
+                    employee_record = lookup_result.get("employee") or lookup_result.get("data") or lookup_result
+                    if isinstance(employee_record, dict):
+                        convo.last_employee_lookup = dict(employee_record)
                 result_text = json.dumps(lookup_result, ensure_ascii=False)
             elif name == "transfer_to_agent":
                 reason = str(args.get("reason") or "Caller requested live agent")
@@ -2522,24 +2546,62 @@ class GeminiService(ServicePlugin):
                 if not isinstance(raw_context, dict):
                     raw_context = {}
 
-                # Only pass the agreed, non-sensitive handoff fields.
+                # Only pass agreed, non-sensitive handoff fields. Enrich from
+                # the most recent successful mock employee lookup so each
+                # transfer carries identity fields even when Gemini omits them.
                 allowed_context_fields = (
-                    "employee_id",
-                    "department",
-                    "region",
-                    "account_status",
-                    "issue_summary",
-                    "data_source",
-                    "ticket_number",
-                    "ticket_type",
-                    "kb_article_id",
-                    "routing_target",
+                    "employee_id", "employee_name", "first_name", "last_name",
+                    "department", "region", "account_status", "concern_type",
+                    "concern_category", "issue_summary", "data_source",
+                    "ticket_number", "ticket_type", "kb_article_id", "routing_target",
                 )
                 handoff_context = {"reason": reason}
                 for field_name in allowed_context_fields:
                     value = raw_context.get(field_name)
-                    if value is not None:
+                    if value is not None and str(value).strip():
                         handoff_context[field_name] = str(value)[:500]
+
+                employee = convo.last_employee_lookup if isinstance(convo.last_employee_lookup, dict) else {}
+                first_name = str(employee.get("first_name") or employee.get("firstName") or "").strip()
+                last_name = str(employee.get("last_name") or employee.get("lastName") or "").strip()
+                employee_name = str(
+                    employee.get("full_name") or employee.get("fullName") or employee.get("employee_name")
+                    or employee.get("name") or " ".join(x for x in (first_name, last_name) if x)
+                ).strip()
+                if employee_name and not first_name:
+                    first_name = employee_name.split()[0]
+                if employee_name and not last_name and len(employee_name.split()) > 1:
+                    last_name = " ".join(employee_name.split()[1:])
+
+                # Explicit tool context wins; otherwise fill from the successful
+                # lookup. Keep keys present in every handoff for stable Infinity mapping.
+                handoff_context.setdefault("employee_id", str(employee.get("employee_id") or employee.get("employeeId") or ""))
+                handoff_context.setdefault("employee_name", employee_name)
+                handoff_context.setdefault("first_name", first_name)
+                handoff_context.setdefault("last_name", last_name)
+                handoff_context.setdefault("department", str(employee.get("department") or ""))
+                handoff_context.setdefault("region", str(employee.get("region") or ""))
+                handoff_context.setdefault("account_status", str(employee.get("account_status") or employee.get("accountStatus") or ""))
+
+                concern_type = str(
+                    handoff_context.get("concern_type") or handoff_context.get("concern_category")
+                    or convo.last_concern_type or ""
+                ).strip().lower()
+                if not concern_type:
+                    issue_text = " ".join([
+                        reason,
+                        str(handoff_context.get("issue_summary") or ""),
+                    ]).lower()
+                    if "password" in issue_text or "reset" in issue_text:
+                        concern_type = "password_reset"
+                    elif "lock" in issue_text or "unlock" in issue_text:
+                        concern_type = "account_lockout"
+                    elif "access" in issue_text or "permission" in issue_text:
+                        concern_type = "access_request"
+                    else:
+                        concern_type = "general"
+                handoff_context["concern_type"] = concern_type
+                handoff_context["concern_category"] = concern_type
 
                 handoff_payload = {
                     "ftype": "LIVE_AGENT_HANDOFF",
