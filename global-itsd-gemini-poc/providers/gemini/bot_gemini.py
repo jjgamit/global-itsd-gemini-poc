@@ -1200,7 +1200,29 @@ class GeminiService(ServicePlugin):
             f"ucid={payload.get('ucid', '')}, "
             f"language={language}"
         )
-        return f"{interpolated}\n\n{context_line}"
+        mode = os.getenv("GEMINI_LANGUAGE_MODE", "auto").strip().lower()
+        supported = os.getenv(
+            "GEMINI_SUPPORTED_LANGUAGES", "English,Filipino/Tagalog,Taglish"
+        ).strip()
+        fixed_language = os.getenv("GEMINI_FIXED_LANGUAGE", "English").strip() or "English"
+        if mode == "fixed":
+            language_policy = (
+                "\n\nLANGUAGE POLICY (CONFIGURED): Respond only in "
+                f"{fixed_language}. This setting overrides conflicting language wording above. "
+                "Keep technical identifiers, employee IDs, email addresses, and ticket numbers unchanged."
+            )
+        else:
+            language_policy = (
+                "\n\nLANGUAGE POLICY (AUTOMATIC): Detect the caller's preferred language from "
+                "their substantive spoken words and respond in that language. Supported languages: "
+                f"{supported}. If the caller speaks Filipino/Tagalog, respond in natural Filipino; "
+                "if they speak Taglish, respond in natural Taglish; if they speak English, respond in English. "
+                "Follow language switches naturally. Do not force English merely because the workflow language "
+                "variable says English. Treat that variable as an initial preference, not a restriction. "
+                "This policy overrides conflicting language instructions above. Preserve all tool calls, "
+                "business rules, and LIVE_AGENT_HANDOFF behavior; do not translate IDs or tool arguments."
+            )
+        return f"{interpolated}\n\n{context_line}" + language_policy
 
     # ------------------------------------------------------------------ bot.end
 
