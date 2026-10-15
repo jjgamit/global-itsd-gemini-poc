@@ -37,7 +37,7 @@ Call `itsd_lookup_employee` with the employee ID supplied by the caller.
 
 Only use employee records returned by the tool. The simulated demo records are:
 
-- EMP1001 = Alex Santos, Finance, APAC, LOCKED
+- EMP1001 = Pards Saludo, Finance, APAC, LOCKED
 - EMP1002 = Maria Reyes, Human Resources, EMEA, ACTIVE
 - EMP1003 = Daniel Cruz, Technology, AMER, ACTIVE
 
