@@ -9,7 +9,7 @@ from itertools import count
 
 MOCK_EMPLOYEES = {
     "EMP1001": {
-        "employee_id": "EMP1001", "first_name": "Pards", "last_name": "Saludo", "full_name": "Pards Santos", "email": "Pards.Saludo@example.com", "department": "Finance", "region": "APAC",
+        "employee_id": "EMP1001", "first_name": "Pards", "last_name": "Saludo", "full_name": "Pards Saludo", "email": "jbsaludo@trends.com.ph", "department": "Finance", "region": "APAC",
         "account_status": "LOCKED", "data_source": "SIMULATED",
     },
     "EMP1002": {
