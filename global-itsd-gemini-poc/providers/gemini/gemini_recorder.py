@@ -1,286 +1,282 @@
+# gemini_recorder.py
+# Replacement recorder for Gemini Live / Avaya Infinity RCMS bridge.
+#
+# Purpose:
+# - Records customer PCM (16 kHz, signed 16-bit little-endian, mono)
+# - Records Gemini PCM (24 kHz, signed 16-bit little-endian, mono)
+# - Writes one combined 24 kHz, 16-bit, mono WAV file
+# - Uses the timestamp of the FIRST chunk from each source to align the tracks
+# - Places later chunks sequentially on their own track instead of positioning
+#   every chunk by callback-arrival time (which can introduce jitter/gaps)
+# - Uses a soft limiter during mixing to reduce hard clipping
+#
+# IMPORTANT:
+# This file is a standalone replacement implementation. Check the existing
+# GeminiRecorder(...) constructor call in bot_gemini.py and make its arguments
+# match the constructor below. The methods add_customer_pcm(), add_gemini_pcm(),
+# and close() are compatible with the integration pattern discussed.
+#
+# Recommended call-site changes in bot_gemini.py:
+#
+# 1) Customer audio:
+#    pcm_16k = self._prepare_input_audio(...)
+#    audio_timestamp = time.monotonic()  # immediately before sending to Gemini
+#    await convo.gm_ws.send(json.dumps(msg))
+#    if convo.recorder is not None:
+#        convo.recorder.add_customer_pcm(pcm_16k, timestamp=audio_timestamp)
+#
+#    Better, to record the same audio even if the send fails, call add_customer_pcm
+#    just before the await, after pcm_16k is prepared:
+#        if convo.recorder is not None:
+#            convo.recorder.add_customer_pcm(pcm_16k, timestamp=time.monotonic())
+#        await convo.gm_ws.send(json.dumps(msg))
+#
+# 2) Gemini audio:
+#    pcm_24k = base64.b64decode(b64)
+#    if convo.recorder is not None:
+#        convo.recorder.add_gemini_pcm(pcm_24k, timestamp=time.monotonic())
+#
+# A timestamp anchors only the first chunk of each track. This is best-effort
+# alignment based on when the bridge receives/processes audio. It cannot provide
+# exact acoustic synchronization if the upstream API does not provide source
+# timestamps or playback timing.
 
-"""Single mixed mono WAV recorder for Gemini Live RCMS sessions.
-
-Customer PCM: 16 kHz, signed 16-bit mono.
-Gemini PCM: 24 kHz, signed 16-bit mono.
-Output: one 24 kHz, 16-bit mono WAV per session.
-
-Audio chunks are placed on a shared monotonic timeline and summed.
-"""
 from __future__ import annotations
 
 import logging
+import math
 import os
-import re
-import struct
 import tempfile
+import threading
 import time
-import uuid
 import wave
 from array import array
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 
-OUTPUT_RATE = 24000
-SAMPLE_WIDTH = 2
-
-
-def _safe_component(value: object, limit: int = 80) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_-]", "_", str(value or "unknown"))
-    return safe[:limit] or "unknown"
-
-
-def _resample_s16le(
-    pcm: bytes, source_rate: int, target_rate: int
-) -> bytes:
-    """Resample signed 16-bit little-endian mono PCM."""
-    usable = len(pcm) - (len(pcm) % 2)
-    pcm = pcm[:usable]
-
-    if not pcm or source_rate == target_rate:
-        return pcm
-
-    samples = array("h")
-    samples.frombytes(pcm)
-
-    if os.sys.byteorder != "little":
-        samples.byteswap()
-
-    if not samples:
-        return b""
-
-    out_count = max(1, round(len(samples) * target_rate / source_rate))
-    out = array("h")
-    scale = source_rate / target_rate
-    last = len(samples) - 1
-
-    for i in range(out_count):
-        pos = min(i * scale, last)
-        lo = int(pos)
-        hi = min(lo + 1, last)
-        frac = pos - lo
-        value = round(
-            samples[lo] * (1.0 - frac) + samples[hi] * frac
-        )
-        out.append(max(-32768, min(32767, value)))
-
-    if os.sys.byteorder != "little":
-        out.byteswap()
-
-    return out.tobytes()
+PathLike = Union[str, os.PathLike]
 
 
 class GeminiRecorder:
-    """Create one mixed mono WAV file per session."""
+    """Record two PCM streams into a single mixed mono WAV file.
+
+    Args:
+        output_path: Full path of the final WAV file.
+        customer_rate: Customer input sample rate (normally 16000).
+        gemini_rate: Gemini output sample rate (normally 24000).
+        output_rate: Output WAV sample rate (normally 24000).
+        normalize_peak: If True, scale the final mix to a safe peak.
+        peak_target: Peak target as a fraction of full scale (0.95 = -0.45 dBFS).
+    """
+
+    OUTPUT_RATE = 24000
+    SAMPLE_WIDTH_BYTES = 2
+    CHANNELS = 1
 
     def __init__(
         self,
-        session_id: str,
-        endpoint_id: str,
-        output_dir: str = "/data/recordings",
+        output_path: PathLike,
+        customer_rate: int = 16000,
+        gemini_rate: int = 24000,
+        output_rate: int = 24000,
+        normalize_peak: bool = True,
+        peak_target: float = 0.95,
     ) -> None:
-        root = Path(output_dir).expanduser()
-        root.mkdir(parents=True, exist_ok=True)
+        self.output_path = Path(output_path)
+        self.customer_rate = int(customer_rate)
+        self.gemini_rate = int(gemini_rate)
+        self.output_rate = int(output_rate)
+        self.normalize_peak = bool(normalize_peak)
+        self.peak_target = max(0.1, min(float(peak_target), 0.99))
 
-        now = datetime.now(timezone.utc)
-        month_dir = root / now.strftime("%Y") / now.strftime("%m")
-        month_dir.mkdir(parents=True, exist_ok=True)
+        if self.customer_rate <= 0 or self.gemini_rate <= 0 or self.output_rate <= 0:
+            raise ValueError("Sample rates must be positive integers")
 
-        stamp = now.strftime("%Y%m%dT%H%M%S%fZ")
-        suffix = uuid.uuid4().hex[:8]
-        base = (
-            f"{stamp}_{_safe_component(session_id)}_"
-            f"{_safe_component(endpoint_id)}_{suffix}"
-        )
-
-        self.output_path = month_dir / f"{base}_mixed_mono_24k.wav"
-        self.paths = (self.output_path,)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self._closed = False
-        self._failed = False
-        self._start = time.monotonic()
+        self._started_at = time.monotonic()
 
-        # Each event: (relative timestamp, sample rate, spool offset, byte length)
-        self._events: List[Tuple[float, int, int, int]] = []
+        # Each source is kept as a sequential PCM spool. This avoids positioning
+        # every individual chunk by its arrival timestamp.
+        self._spools = {
+            "customer": tempfile.TemporaryFile(mode="w+b"),
+            "gemini": tempfile.TemporaryFile(mode="w+b"),
+        }
+        self._track_first_timestamp: dict[str, Optional[float]] = {
+            "customer": None,
+            "gemini": None,
+        }
+        self._track_bytes: dict[str, int] = {"customer": 0, "gemini": 0}
+        self._track_rates = {
+            "customer": self.customer_rate,
+            "gemini": self.gemini_rate,
+        }
 
-        self._spool = tempfile.NamedTemporaryFile(
-            mode="w+b",
-            prefix=".gemini-rec-",
-            suffix=".tmp",
-            dir=str(month_dir),
-            delete=False,
-        )
-        self._spool_path = Path(self._spool.name)
-        self._max_end_sample = 0
+    def add_customer_pcm(self, pcm_bytes: bytes, timestamp: Optional[float] = None) -> None:
+        """Append one customer PCM chunk (S16LE mono, normally 16 kHz)."""
+        self._add("customer", pcm_bytes, timestamp)
 
-        logger.info(
-            "Gemini mixed WAV recording started: %s",
-            self.output_path.name,
-        )
+    def add_gemini_pcm(self, pcm_bytes: bytes, timestamp: Optional[float] = None) -> None:
+        """Append one Gemini PCM chunk (S16LE mono, normally 24 kHz)."""
+        self._add("gemini", pcm_bytes, timestamp)
 
-    def add_customer_pcm(self, pcm_bytes: bytes) -> None:
-        self._add(pcm_bytes, 16000, "customer")
-
-    def add_gemini_pcm(self, pcm_bytes: bytes) -> None:
-        self._add(pcm_bytes, 24000, "Gemini")
-
-    def _add(self, pcm_bytes: bytes, source_rate: int, label: str) -> None:
-        if self._closed or self._failed or not pcm_bytes:
+    def _add(self, source: str, pcm_bytes: bytes, timestamp: Optional[float]) -> None:
+        if not pcm_bytes:
+            return
+        data = bytes(pcm_bytes)
+        # S16LE PCM must contain whole 16-bit samples.
+        if len(data) % 2:
+            data = data[:-1]
+        if not data:
             return
 
-        usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
-        if usable <= 0:
-            return
+        with self._lock:
+            if self._closed:
+                logger.debug("Ignoring %s PCM after recorder was closed", source)
+                return
 
-        try:
-            timestamp = time.monotonic() - self._start
+            if self._track_first_timestamp[source] is None:
+                # timestamp is from time.monotonic() when supplied by caller.
+                # If absent, use current time as a best-effort anchor.
+                self._track_first_timestamp[source] = (
+                    float(timestamp) if timestamp is not None else time.monotonic()
+                )
 
-            self._spool.seek(0, os.SEEK_END)
-            offset = self._spool.tell()
-            self._spool.write(pcm_bytes[:usable])
-            self._spool.flush()
-
-            self._events.append(
-                (timestamp, source_rate, offset, usable)
-            )
-
-            duration_samples = round(
-                (usable // 2) * OUTPUT_RATE / source_rate
-            )
-            start_sample = max(0, round(timestamp * OUTPUT_RATE))
-            self._max_end_sample = max(
-                self._max_end_sample,
-                start_sample + duration_samples,
-            )
-
-        except Exception as exc:
-            logger.warning(
-                "Gemini recorder spool write failed for %s: %s",
-                label,
-                exc,
-            )
-            self._failed = True
+            spool = self._spools[source]
+            spool.seek(0, os.SEEK_END)
+            spool.write(data)
+            self._track_bytes[source] += len(data)
 
     @staticmethod
-    def _mix_chunk(mix_file, start_sample: int, pcm: bytes) -> None:
-        """Sum PCM into the output buffer, clipping to 16-bit range."""
-        usable = len(pcm) - (len(pcm) % 2)
-        values = array("h")
-        values.frombytes(pcm[:usable])
-
+    def _bytes_to_samples(pcm_bytes: bytes) -> array:
+        samples = array("h")
+        samples.frombytes(pcm_bytes)
+        # array('h') is native-endian. Convert to/from little endian explicitly
+        # on big-endian systems so WAV samples remain S16LE.
         if os.sys.byteorder != "little":
-            values.byteswap()
+            samples.byteswap()
+        return samples
 
-        mix_file.seek(start_sample * SAMPLE_WIDTH)
-        existing_bytes = mix_file.read(len(values) * SAMPLE_WIDTH)
-
-        existing = array("h")
-        existing.frombytes(existing_bytes)
-
+    @staticmethod
+    def _samples_to_bytes(samples: array) -> bytes:
+        out = array("h", samples)
         if os.sys.byteorder != "little":
-            existing.byteswap()
+            out.byteswap()
+        return out.tobytes()
 
-        if len(existing) < len(values):
-            existing.extend([0] * (len(values) - len(existing)))
+    @staticmethod
+    def _resample_linear(samples: array, src_rate: int, dst_rate: int) -> array:
+        """Simple linear resampler. Output length is rounded to sample duration."""
+        if not samples:
+            return array("h")
+        if src_rate == dst_rate:
+            return array("h", samples)
 
-        for i, value in enumerate(values):
-            existing[i] = max(
-                -32768,
-                min(32767, existing[i] + value),
-            )
+        out_len = max(1, int(round(len(samples) * dst_rate / src_rate)))
+        out = array("h")
+        last = len(samples) - 1
 
-        if os.sys.byteorder != "little":
-            existing.byteswap()
+        for i in range(out_len):
+            # Map output sample position to source sample position.
+            pos = i * src_rate / dst_rate
+            left = min(int(pos), last)
+            right = min(left + 1, last)
+            frac = pos - left
+            value = samples[left] + (samples[right] - samples[left]) * frac
+            out.append(max(-32768, min(32767, int(round(value)))))
+        return out
 
-        mix_file.seek(start_sample * SAMPLE_WIDTH)
-        mix_file.write(existing.tobytes())
+    def _read_track_at_output_rate(self, source: str) -> tuple[array, int]:
+        """Return resampled samples and the track's start sample on output timeline."""
+        spool = self._spools[source]
+        spool.seek(0)
+        pcm = spool.read()
+        samples = self._bytes_to_samples(pcm)
+        converted = self._resample_linear(samples, self._track_rates[source], self.output_rate)
 
-    def close(self):
-        """Finalize the WAV and remove temporary spool files."""
-        if self._closed:
-            return self.paths
+        first_ts = self._track_first_timestamp[source]
+        if first_ts is None:
+            return converted, 0
 
-        self._closed = True
-        mix_raw_path: Optional[Path] = None
+        # Align the first chunk of each track to the common recorder clock.
+        # Subsequent chunks are sequential, preserving within-track timing.
+        start_seconds = max(0.0, first_ts - self._started_at)
+        start_sample = int(round(start_seconds * self.output_rate))
+        return converted, start_sample
 
-        try:
-            self._spool.flush()
+    @staticmethod
+    def _soft_limit(value: float, limit: float = 32700.0) -> int:
+        """Softly limit peaks rather than hard-clipping the summed waveform."""
+        if value > limit:
+            value = limit + (32767.0 - limit) * math.tanh((value - limit) / (32767.0 - limit))
+        elif value < -limit:
+            value = -limit + (32767.0 - limit) * math.tanh((value + limit) / (32767.0 - limit))
+        return max(-32768, min(32767, int(round(value))))
 
-            if self._failed:
-                raise OSError("Recording spool failed")
-
-            fd, raw_name = tempfile.mkstemp(
-                prefix=".gemini-mix-",
-                suffix=".tmp",
-                dir=str(self.output_path.parent),
-            )
-            os.close(fd)
-            mix_raw_path = Path(raw_name)
-
-            with open(mix_raw_path, "w+b") as mixed:
-                mixed.truncate(self._max_end_sample * SAMPLE_WIDTH)
-
-                for timestamp, source_rate, offset, length in self._events:
-                    self._spool.seek(offset)
-                    pcm = self._spool.read(length)
-
-                    converted = _resample_s16le(
-                        pcm,
-                        source_rate,
-                        OUTPUT_RATE,
-                    )
-                    start_sample = max(
-                        0,
-                        round(timestamp * OUTPUT_RATE),
-                    )
-
-                    self._mix_chunk(mixed, start_sample, converted)
-
-            with wave.open(str(self.output_path), "wb") as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(SAMPLE_WIDTH)
-                wav.setframerate(OUTPUT_RATE)
-
-                with open(mix_raw_path, "rb") as mixed:
-                    while True:
-                        block = mixed.read(1024 * 1024)
-                        if not block:
-                            break
-                        wav.writeframesraw(block)
-
-            logger.info(
-                "Gemini mixed WAV finalized: %s (events=%d)",
-                self.output_path.name,
-                len(self._events),
-            )
-
-        except Exception as exc:
-            logger.warning(
-                "Could not finalize Gemini mixed WAV recording: %s",
-                exc,
-            )
-            try:
-                self.output_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-        finally:
-            try:
-                self._spool.close()
-            except Exception:
-                pass
+    def close(self) -> list[str]:
+        """Finalize the WAV file and return [output_path] for call-site compatibility."""
+        with self._lock:
+            if self._closed:
+                return [str(self.output_path)]
+            self._closed = True
 
             try:
-                self._spool_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+                customer, customer_start = self._read_track_at_output_rate("customer")
+                gemini, gemini_start = self._read_track_at_output_rate("gemini")
 
-            if mix_raw_path is not None:
-                try:
-                    mix_raw_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                end_customer = customer_start + len(customer)
+                end_gemini = gemini_start + len(gemini)
+                total_samples = max(end_customer, end_gemini, 0)
 
-        return self.paths
+                if total_samples == 0:
+                    mixed = array("h")
+                else:
+                    # Use float accumulator so overlapping streams do not overflow.
+                    mix = [0.0] * total_samples
+                    for i, sample in enumerate(customer):
+                        mix[customer_start + i] += float(sample)
+                    for i, sample in enumerate(gemini):
+                        mix[gemini_start + i] += float(sample)
+
+                    peak = max((abs(v) for v in mix), default=0.0)
+                    if self.normalize_peak and peak > 0:
+                        gain = (32767.0 * self.peak_target) / peak
+                    else:
+                        gain = 1.0
+
+                    mixed = array("h", (self._soft_limit(v * gain) for v in mix))
+
+                pcm_out = self._samples_to_bytes(mixed)
+                temp_path = self.output_path.with_suffix(self.output_path.suffix + ".tmp")
+
+                with wave.open(str(temp_path), "wb") as wav:
+                    wav.setnchannels(self.CHANNELS)
+                    wav.setsampwidth(self.SAMPLE_WIDTH_BYTES)
+                    wav.setframerate(self.output_rate)
+                    wav.writeframes(pcm_out)
+
+                os.replace(temp_path, self.output_path)
+                logger.info(
+                    "Gemini mixed recording saved: %s (rate=%d, samples=%d, duration=%.2fs)",
+                    self.output_path,
+                    self.output_rate,
+                    len(mixed),
+                    len(mixed) / self.output_rate,
+                )
+                return [str(self.output_path)]
+
+            finally:
+                for spool in self._spools.values():
+                    try:
+                        spool.close()
+                    except Exception:
+                        logger.debug("Unable to close recorder spool", exc_info=True)
+
+    def __enter__(self) -> "GeminiRecorder":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
