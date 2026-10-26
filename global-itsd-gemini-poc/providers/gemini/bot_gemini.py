@@ -212,6 +212,8 @@ except ImportError:
 import websockets
 from websockets.server import WebSocketServerProtocol
 
+from providers.gemini.gemini_recorder import GeminiRecorder
+
 from bridge_server import (
     G722_AVAILABLE,
     ServicePlugin,
@@ -382,6 +384,8 @@ class BotConversation:
     transport_encoding: str
     gm_ws: Optional[Any] = None
     gm_recv_task: Optional[asyncio.Task] = None
+    # Optional per-call WAV recorder; enabled with GEMINI_RECORDING_ENABLED=true.
+    recorder: Optional[Any] = None
     active: bool = False
     # Set True by send_bot_ended_with_*_context helpers after a successful
     # bot.ended emission (success / failure / disconnect). Read by
@@ -997,6 +1001,26 @@ class GeminiService(ServicePlugin):
             )
             return
 
+        # Recording is opt-in and must never prevent the AI call from starting.
+        if os.getenv("GEMINI_RECORDING_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on"):
+            try:
+                recording_dir = os.getenv("GEMINI_RECORDING_DIR", "/data/recordings")
+                convo.recorder = GeminiRecorder(
+                    session_id=session_id,
+                    endpoint_id=endpoint_id,
+                    output_dir=recording_dir,
+                )
+                logger.info(
+                    "[%s] Gemini recording enabled: session=%s endpoint=%s directory=%s",
+                    client_id, session_id, endpoint_id, recording_dir,
+                )
+            except Exception as exc:
+                convo.recorder = None
+                logger.warning(
+                    "[%s] Could not initialize Gemini recording; call will continue without recording: %s",
+                    client_id, exc,
+                )
+
         key = self._key(session_id, endpoint_id)
         existing = self._conversations.pop(key, None)
         if existing:
@@ -1439,6 +1463,12 @@ class GeminiService(ServicePlugin):
         except Exception as exc:
             logger.error("[%s] Send to Gemini failed: %s", convo.client_id, exc)
             return False
+
+        # Capture the exact 16 kHz S16LE PCM sent to Gemini. Recording errors
+        # are isolated inside GeminiRecorder and must not interrupt live audio.
+        if convo.recorder is not None:
+            convo.recorder.add_customer_pcm(pcm_16k)
+
         return True
 
     def _prepare_input_audio(self, convo: BotConversation, audio_bytes: bytes) -> Optional[bytes]:
@@ -2352,6 +2382,12 @@ class GeminiService(ServicePlugin):
                 out_bytes = self._transcode_output_audio(convo, pcm_24k)
                 if not out_bytes:
                     continue
+
+                # Capture Gemini's original 24 kHz S16LE output for the mixed mono
+                # recording timeline before Infinity-side codec conversion/pacing.
+                if convo.recorder is not None:
+                    convo.recorder.add_gemini_pcm(pcm_24k)
+
                 if not convo.ingress_ready:
                     if len(convo.ingress_buffer) >= _INGRESS_BUFFER_MAX_CHUNKS:
                         logger.warning(
@@ -3319,6 +3355,24 @@ class GeminiService(ServicePlugin):
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
+
+        # Stop writing only after the Gemini receive loop has been cancelled,
+        # so the WAV headers are finalized and no concurrent writes remain.
+        recorder = convo.recorder
+        convo.recorder = None
+        if recorder is not None:
+            try:
+                paths = recorder.close()
+                logger.info(
+                    "[%s] Gemini recording finalized: session=%s files=%s",
+                    convo.client_id, convo.session_id,
+                    [str(p) for p in paths] if paths else "unknown",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to finalize Gemini recording for session=%s: %s",
+                    convo.client_id, convo.session_id, exc,
+                )
 
         ws = convo.gm_ws
         convo.gm_ws = None
